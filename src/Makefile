@@ -10,3 +10,5 @@ clean:
 install:
 	mkdir -p /usr/local/bin
 	cp netcam /usr/local/bin
+	cp netcam.sh /etc/init.d/
+	update-rc.d netcam.sh defaults
