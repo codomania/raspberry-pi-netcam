@@ -6,9 +6,13 @@ BUILDING
 ========
 
 sudo apt-get install libv4l2-dev
+
 make
+
 sudo make install
+
 sudo reboot
+
 
 RUNNING
 =======
