@@ -2,10 +2,10 @@
 
 Simple IP network camera for raspberry pi
 
-BUILDING
-========
+BUILD AND INSTALL
+=================
 
-sudo apt-get install libv4l2-dev
+sudo apt-get install libv4l-dev
 
 make
 
@@ -17,6 +17,6 @@ sudo reboot
 RUNNING
 =======
 
-The camera can be accessed by http://<YOUR_IP_ADDERSS>:8081
+The camera can be accessed by http://YOUR_IP_ADDERSS:8081
 
 
