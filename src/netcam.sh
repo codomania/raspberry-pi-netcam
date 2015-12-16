@@ -26,6 +26,9 @@ test -x $DAEMON || exit 0
 
 RET=0
 
+# load v4l2 modules
+modprobe bcm2835_v4l2 max_video_width=1920 max_video_height=1080
+
 case "$1" in
   start) 
     log_daemon_msg "Starting $DESC" "$NAME" 
