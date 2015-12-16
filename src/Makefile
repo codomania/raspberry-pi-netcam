@@ -6,3 +6,7 @@ netcam: netcam.o
 
 clean:
 	rm -rf *.o netcam
+
+install:
+	mkdir -p /usr/local/bin
+	cp netcam /usr/local/bin
