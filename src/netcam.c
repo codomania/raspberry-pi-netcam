@@ -378,7 +378,8 @@ int main(int argc, char **argv)
 	openlog(argv[0], LOG_PID, LOG_USER);
 
 	/* make this as daemon */
-	daemon(0, 1);
+	if (daemon(0, 1) < 0)
+		fprintf(stderr, "failed to init deamon\n");
 
 	/* create a server socket */
 	server_fd = create_sock(SERVER_PORT);
