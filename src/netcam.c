@@ -32,6 +32,18 @@
 #define MAX_BUFFER_SIZE	4096
 #define TARGET_FPS	15
 
+#define INDEX_HTML	"\
+<HTML>\r\n\
+<HEAD>\r\n\
+<TITLE>	IP Network cam </TITLE>\r\n\
+</HEAD>\r\n\
+<BODY>\r\n\
+	<H2> IP Network camera	</H2>\r\n\
+	<table border=1 bgcolor=#00000000> <tr><td><image src=/stream_mjpeg/></td></tr></table>\r\n\
+</body>\r\n\
+</html>\r\n\
+"
+
 struct buffer {
         void   *start;
         size_t length;
@@ -310,6 +322,7 @@ static void add_new_connection (int server_fd)
 	socklen_t size;
 	struct sockaddr_in client;
 	struct client_info *info;
+	char buf[MAX_BUFFER_SIZE] = {0};
 
 	size = sizeof(client);
 	fd = accept(server_fd, (struct sockaddr*)&client, &size);
@@ -318,28 +331,43 @@ static void add_new_connection (int server_fd)
 		return;
 	}
 
-	/* record the client */
-	pthread_mutex_lock(&mutex);
-	if (active_client_count == MAX_CONNECTION) {
-		pthread_mutex_unlock(&mutex);
-		goto failed;
-	}
-	active_client_count++;
-	pthread_mutex_unlock(&mutex);
-	
-	info = malloc(sizeof(*info));
-	if (!info) {
-		syslog(LOG_ERR, "no memory");
-		goto failed;
-	}
-	info->fd = fd;
-	memcpy(&info->sockaddr, &client, size);
-	pthread_create(&tid, NULL, start_client, (void*)info);
+	/* read the browser header */
+	recv(fd, buf, MAX_BUFFER_SIZE, MSG_NOSIGNAL);
 
-	return;
-failed:
-	http_error(fd);
-	syslog(LOG_ERR, "too many connection!");
+	/* if header contain 'stream_mjpeg' url then start streaming
+	 * otherwise send the HTML index page.
+	 */
+	if (strstr(buf, "stream_mjpeg")) {
+		/* check if we have reached to the connection limit */
+		pthread_mutex_lock(&mutex);
+		if (active_client_count == MAX_CONNECTION) {
+			pthread_mutex_unlock(&mutex);
+			http_error(fd);
+			syslog(LOG_ERR, "too many connection!");
+		}
+		active_client_count++;
+		pthread_mutex_unlock(&mutex);
+
+		info = malloc(sizeof(*info));
+		if (!info) {
+			syslog(LOG_ERR, "no memory");
+			return;
+		}
+		info->fd = fd;
+		memcpy(&info->sockaddr, &client, size);
+		pthread_create(&tid, NULL, start_client, (void*)info);
+
+	} else {
+
+		snprintf(buf, MAX_BUFFER_SIZE,
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: text/html;\r\n"
+			"Content-Length: %d\r\n\r\n"
+			"%s", strlen(INDEX_HTML), INDEX_HTML);
+		send(fd, buf, strlen(buf), MSG_NOSIGNAL);
+		close(fd);
+	}
+
 	return;
 }
 
@@ -381,9 +409,10 @@ int main(int argc, char **argv)
 	openlog(argv[0], LOG_CONS | LOG_PID | LOG_PERROR, LOG_USER);
 
 	/* make this as daemon */
-	if (daemon(0, 1) < 0)
-		fprintf(stderr, "failed to init deamon\n");
-
+	if (daemon(0, 1) < 0) {
+		syslog(LOG_ERR, "failed to init deamon\n");
+		exit(EXIT_FAILURE);
+	}
 	/* create a server socket */
 	server_fd = create_sock(SERVER_PORT);
 	
