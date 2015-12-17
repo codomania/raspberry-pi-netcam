@@ -30,7 +30,7 @@
 #define MAX_CONNECTION	30
 #define SERVER_PORT	8081
 #define MAX_BUFFER_SIZE	4096
-#define TARGET_FPS	30
+#define TARGET_FPS	15
 
 struct buffer {
         void   *start;
