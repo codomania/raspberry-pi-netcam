@@ -30,6 +30,7 @@
 #define MAX_CONNECTION	30
 #define SERVER_PORT	8081
 #define MAX_BUFFER_SIZE	4096
+#define TARGET_FPS	30
 
 struct buffer {
         void   *start;
@@ -54,7 +55,7 @@ static void xioctl(int fh, int request, void *arg)
         } while (r == -1 && ((errno == EINTR) || (errno == EAGAIN)));
 
         if (r == -1) {
-                fprintf(stderr, "error %d, %s\n", errno, strerror(errno));
+                syslog(LOG_ERR, "ioctl failed: %s",strerror(errno));
                 exit(EXIT_FAILURE);
         }
 }
@@ -74,7 +75,7 @@ static void* start_camera (void *unused)
 
 	fd = v4l2_open(VIDEO_DEVICE, O_RDWR | O_NONBLOCK, 0);
 	if (fd < 0) {
-		syslog(LOG_ERR, "failed to open /dev/video0");
+		syslog(LOG_ERR, "failed to open /dev/video0: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 	syslog(LOG_DEBUG, "[%s] opened\n", VIDEO_DEVICE);
@@ -125,7 +126,7 @@ static void* start_camera (void *unused)
 			      fd, buf.m.offset);
 
 		if (MAP_FAILED == buffers[n_buffers].start) {
-			syslog(LOG_ERR, "failed to mmap");
+			syslog(LOG_ERR, "failed to mmap: %s", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
 
@@ -178,7 +179,7 @@ static void* start_camera (void *unused)
 		} while ((r == -1 && (errno = EINTR)));
 
 		if (r == -1) {
-			perror("select");
+			syslog(LOG_ERR, "select failed: %s", strerror(errno));
 			break;
 		}
 
@@ -217,6 +218,7 @@ static void* start_client (void *args)
 	int fd, len;
 	char *message;
 	struct client_info *info = (struct client_info*)args;
+	unsigned int sleep_us;
 
 	data = malloc(sizeof(char) * VIDEO_WIDTH * VIDEO_HEIGHT * 4);
 	if (!data) {
@@ -268,7 +270,8 @@ static void* start_client (void *args)
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 
-		usleep(1000*66); /* throttle to 15fps */
+		sleep_us = 1000 * (((double)1/TARGET_FPS) * 1000);
+		usleep(sleep_us); /* throttle to targeted fps */
 	}
 failed:
 	syslog(LOG_DEBUG, "closing connection from host '%s' on port '%d'\n",
@@ -311,7 +314,7 @@ static void add_new_connection (int server_fd)
 	size = sizeof(client);
 	fd = accept(server_fd, (struct sockaddr*)&client, &size);
 	if (fd < 0) {
-		syslog(LOG_ERR, "failed to accept");
+		syslog(LOG_ERR, "failed to accept connection:%s",strerror(errno));
 		return;
 	}
 
@@ -347,7 +350,7 @@ static int create_sock (int port)
 	
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
-		syslog(LOG_ERR, "socket create failed");
+		syslog(LOG_ERR, "socket create failed: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
@@ -356,12 +359,12 @@ static int create_sock (int port)
 	server.sin_port = htons(port);
 
 	if (bind(fd, (struct sockaddr*) &server, sizeof(server)) < 0) {
-		syslog(LOG_ERR, "socket bind failed");
+		syslog(LOG_ERR, "socket bind failed: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
 	if (listen(fd, 3) < 0) {
-		syslog(LOG_ERR, "socket listen failed");
+		syslog(LOG_ERR, "socket listen failed: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
@@ -375,7 +378,7 @@ int main(int argc, char **argv)
 	pthread_t camera_tid;
 	fd_set active_fd_set, read_fd_set;
 
-	openlog(argv[0], LOG_PID, LOG_USER);
+	openlog(argv[0], LOG_CONS | LOG_PID | LOG_PERROR, LOG_USER);
 
 	/* make this as daemon */
 	if (daemon(0, 1) < 0)
@@ -395,7 +398,7 @@ int main(int argc, char **argv)
 		/* block until input arrives on one or more active sockets */
 		read_fd_set = active_fd_set;
 		if (select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL) < 0) {
-			syslog(LOG_ERR, "select failure\n");
+			syslog(LOG_ERR, "select failure: %s", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
 
