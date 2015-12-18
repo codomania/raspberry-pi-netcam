@@ -344,6 +344,7 @@ static void add_new_connection (int server_fd)
 			pthread_mutex_unlock(&mutex);
 			http_error(fd);
 			syslog(LOG_ERR, "too many connection!");
+			return;
 		}
 		active_client_count++;
 		pthread_mutex_unlock(&mutex);
