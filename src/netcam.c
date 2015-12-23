@@ -1,4 +1,8 @@
-/* a simple IP netcam for raspberry pi using low-level v4l2 API */
+/*
+ * a simple IP netcam for raspberry pi using low-level v4l2 API
+ *
+ * Author: Brijesh Singh <brijesh.ksingh@gmail.com>
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,12 +29,13 @@
 
 #define VIDEO_DEVICE	"/dev/video0"
 #define CLEAR(x)	memset(&(x), 0, sizeof(x))
-#define VIDEO_WIDTH	320
-#define VIDEO_HEIGHT	240
-#define MAX_CONNECTION	30
+#define VIDEO_WIDTH	352
+#define VIDEO_HEIGHT	288
+#define MAX_CONNECTION	10
 #define SERVER_PORT	8081
 #define MAX_BUFFER_SIZE	4096
-#define TARGET_FPS	15
+#define TARGET_FPS	30
+#define NUM_CIRC_BUFS	10
 
 #define INDEX_HTML	"\
 <HTML>\r\n\
@@ -38,8 +43,10 @@
 <TITLE>	IP Network cam </TITLE>\r\n\
 </HEAD>\r\n\
 <BODY>\r\n\
-	<H2> IP Network camera	</H2>\r\n\
-	<table border=1 bgcolor=#00000000> <tr><td><image src=/stream_mjpeg/></td></tr></table>\r\n\
+	<table>\r\n\
+	<tr><td><center><b>Raspberry pi network camera</b></center></td></tr>\r\n\
+	<tr><td><table border=1 bgcolor=#000000><tr><td><image src=/stream_mjpeg/></td></tr></table></tr></td>\r\n\
+	</table>\r\n\
 </body>\r\n\
 </html>\r\n\
 "
@@ -49,16 +56,114 @@ struct buffer {
         size_t length;
 };
 
+struct circ_buffer {
+	int len;
+	int head, tail;
+	pthread_cond_t cond;
+	pthread_mutex_t mutex;
+	void *data[NUM_CIRC_BUFS];
+	int length[NUM_CIRC_BUFS];
+};
+
 struct client_info {
 	int fd;
 	struct sockaddr_in sockaddr;
+	struct circ_buffer *circ_buffer;
 };
 
+static int imagesize;
 static pthread_mutex_t mutex;
-static int active_client_count;
-static struct buffer image;
+static struct circ_buffer circ_buffer;
+static struct client_info clients[MAX_CONNECTION];
+static int camera_running;
 
-static void xioctl(int fh, int request, void *arg)
+static void queue_get(struct circ_buffer *circ_buf, struct buffer *buf)
+{
+	pthread_mutex_lock(&circ_buf->mutex);
+	if (circ_buf->head == circ_buf->tail) /* queue is empty */
+		pthread_cond_wait(&circ_buf->cond, &circ_buf->mutex);
+	buf->length = circ_buf->length[circ_buf->head];
+	memcpy(buf->start, circ_buf->data[circ_buf->head], buf->length);
+	circ_buf->head = (circ_buf->head + 1) % NUM_CIRC_BUFS;
+	pthread_mutex_unlock(&circ_buf->mutex);
+}
+
+static void queue_put(struct circ_buffer *circ_buf, void *buf, int len)
+{
+	int head, tail;
+
+	pthread_mutex_lock(&circ_buf->mutex);
+	head = circ_buf->head;
+	tail = circ_buf->tail;
+	memcpy(circ_buf->data[tail], buf, len);
+	circ_buf->length[tail] = len;
+	tail = (tail + 1) % NUM_CIRC_BUFS;
+	if (tail == head) /* queue is full */
+		head = head + 1;
+	if (head >= NUM_CIRC_BUFS) /* reset head */
+		head = 0;
+	circ_buf->head = head;
+	circ_buf->tail = tail;
+	pthread_cond_broadcast(&circ_buf->cond);
+	pthread_mutex_unlock(&circ_buf->mutex);
+}
+
+static void broadcast_image(void *buf, int len)
+{
+	int i;
+
+	pthread_mutex_lock(&mutex);
+	for (i = 0; i < MAX_CONNECTION; i++) {
+		if (clients[i].fd && clients[i].circ_buffer)
+			queue_put(clients[i].circ_buffer, buf, len);
+	}
+	pthread_mutex_unlock(&mutex);
+}
+
+static void free_circ_buffer(struct circ_buffer *buf)
+{
+	int i;
+
+	if (buf) {
+		printf("free circular buffer %p\n", buf);
+		for (i = 0; i < NUM_CIRC_BUFS; i++)
+			if (buf->data[i])
+				free(buf->data[i]);
+		pthread_mutex_destroy(&buf->mutex);
+		pthread_cond_destroy(&buf->cond);
+		free(buf);
+	}
+}
+
+static struct circ_buffer* alloc_circ_buffer()
+{
+	int i;
+	struct circ_buffer *buf;
+
+	buf = calloc(1, sizeof(*buf));
+	if (!buf)
+		return NULL;
+
+	pthread_mutex_init(&buf->mutex, NULL);
+	pthread_cond_init(&buf->cond, NULL);
+
+	for (i = 0; i < NUM_CIRC_BUFS; i++) {
+		buf->data[i] = malloc(imagesize);
+		if ((buf->data[i]) == NULL) {
+			syslog(LOG_ERR, "malloc() failed %s\n", strerror(errno));
+			goto failed;
+		}
+	}
+
+	printf("allocate circular buffer %p(%.2fKB)\n", buf,
+		(double)(imagesize * NUM_CIRC_BUFS) / 1024);
+	return buf;
+failed:
+	free_circ_buffer(buf);
+	return NULL;
+}
+
+static int xioctl(int fh, int request, void *arg)
 {
         int r;
 
@@ -68,8 +173,9 @@ static void xioctl(int fh, int request, void *arg)
 
         if (r == -1) {
                 syslog(LOG_ERR, "ioctl failed: %s",strerror(errno));
-                exit(EXIT_FAILURE);
         }
+
+	return r;
 }
 
 static void* start_camera (void *unused)
@@ -88,9 +194,9 @@ static void* start_camera (void *unused)
 	fd = v4l2_open(VIDEO_DEVICE, O_RDWR | O_NONBLOCK, 0);
 	if (fd < 0) {
 		syslog(LOG_ERR, "failed to open /dev/video0: %s", strerror(errno));
-		exit(EXIT_FAILURE);
+		goto failed;
 	}
-	syslog(LOG_DEBUG, "[%s] opened\n", VIDEO_DEVICE);
+	printf("[%s] opened\n", VIDEO_DEVICE);
 
 	CLEAR(fmt);
 	fmt.type		= V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -103,7 +209,7 @@ static void* start_camera (void *unused)
 		syslog(LOG_WARNING,
 			"%s did not accept MJPEG format. Can't proceed.\n",
 			VIDEO_DEVICE);
-		exit(EXIT_FAILURE);
+		goto failed;
 	}
 
 	if ((fmt.fmt.pix.width != VIDEO_WIDTH) ||
@@ -111,16 +217,17 @@ static void* start_camera (void *unused)
 		syslog(LOG_DEBUG, "Warning: driver is sending image at %dx%d\n",
 			fmt.fmt.pix.width, fmt.fmt.pix.height);
 
-	syslog(LOG_DEBUG, "[%s] configured MJPEG @ %dx%d\n", VIDEO_DEVICE,
+	printf("[%s] configured MJPEG @ %dx%d\n", VIDEO_DEVICE,
 		fmt.fmt.pix.width, fmt.fmt.pix.height);
 
 	CLEAR(req);
 	req.count = 4;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_MMAP;
-	xioctl(fd, VIDIOC_REQBUFS, &req);
+	if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0)
+		goto failed;
 
-	syslog(LOG_DEBUG, "[%s] configure %d buffers\n", VIDEO_DEVICE, req.count);
+	printf("[%s] configure %d buffers\n", VIDEO_DEVICE, req.count);
 
 	buffers = calloc(req.count, sizeof(*buffers));
 	for (n_buffers = 0; n_buffers < req.count; ++n_buffers) {
@@ -130,7 +237,8 @@ static void* start_camera (void *unused)
 		buf.memory      = V4L2_MEMORY_MMAP;
 		buf.index       = n_buffers;
 
-		xioctl(fd, VIDIOC_QUERYBUF, &buf);
+		if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0)
+			goto failed;
 
 		buffers[n_buffers].length = buf.length;
 		buffers[n_buffers].start = v4l2_mmap(NULL, buf.length,
@@ -138,21 +246,14 @@ static void* start_camera (void *unused)
 			      fd, buf.m.offset);
 
 		if (MAP_FAILED == buffers[n_buffers].start) {
-			syslog(LOG_ERR, "failed to mmap: %s", strerror(errno));
-			exit(EXIT_FAILURE);
+			syslog(LOG_ERR, "mmap() failed: %s", strerror(errno));
+			goto failed;
 		}
 
-		syslog(LOG_DEBUG, "[%s] mmap index=%d, start=%p len=%d\n", VIDEO_DEVICE,
+		printf("[%s] mmap index=%d, start=%p len=%d\n", VIDEO_DEVICE,
 			n_buffers, buffers[n_buffers].start, buf.length);
 
-		if (!image.start) {
-			image.start = malloc(sizeof(char) * buf.length);
-			if (!image.start) {
-				syslog(LOG_ERR, "no memory\n");
-				exit(EXIT_FAILURE);
-			}
-			image.length = buf.length;
-		}
+		imagesize = buf.length;
 	}
 
 	for (i = 0; i < n_buffers; ++i) {
@@ -160,11 +261,13 @@ static void* start_camera (void *unused)
 		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory = V4L2_MEMORY_MMAP;
 		buf.index = i;
-		xioctl(fd, VIDIOC_QBUF, &buf);
+		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
+			goto unmap_buffer;
 	}
 
 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	xioctl(fd, VIDIOC_STREAMON, &type);
+	if (xioctl(fd, VIDIOC_STREAMON, &type) < 0)
+		goto unmap_buffer;
 
 	syslog(LOG_DEBUG, "[%s] start streaming\n", VIDEO_DEVICE);
 	getifaddrs(&ipaddrs);
@@ -177,6 +280,8 @@ static void* start_camera (void *unused)
 		}
 		tmp = tmp->ifa_next;
 	}
+
+	camera_running = 1;
 
 	while (1) {
 		do {
@@ -192,69 +297,77 @@ static void* start_camera (void *unused)
 
 		if (r == -1) {
 			syslog(LOG_ERR, "select failed: %s", strerror(errno));
-			break;
+			goto stop_stream;
 		}
 
 		CLEAR(buf);
 		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory = V4L2_MEMORY_MMAP;
-		xioctl(fd, VIDIOC_DQBUF, &buf);
+		if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0)
+			goto stop_stream;
 
-		pthread_mutex_lock(&mutex);
-		image.length = buf.length;
-		memcpy(image.start, buffers[buf.index].start, buf.length);
-		pthread_mutex_unlock(&mutex);
+		/* send buffer to clients */
+		broadcast_image(buffers[buf.index].start, buf.length);
 
-		xioctl(fd, VIDIOC_QBUF, &buf);
+		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
+			goto stop_stream;
 	}
 
+stop_stream:
 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	xioctl(fd, VIDIOC_STREAMOFF, &type);
 	syslog(LOG_DEBUG, "[%s] stopping streaming\n", VIDEO_DEVICE);
 
+unmap_buffer:
 	for (i = 0; i < n_buffers; ++i) {
 		v4l2_munmap(buffers[i].start, buffers[i].length);
-		syslog(LOG_DEBUG, "[%s] unmap index=%d buffer=%p\n", VIDEO_DEVICE,
+		printf("[%s] unmap index=%d buffer=%p\n", VIDEO_DEVICE,
 			i, buffers[i].start);
 	}
 
+failed:
 	v4l2_close(fd);
-	syslog(LOG_DEBUG, "[%s] closed\n", VIDEO_DEVICE);
+	printf("[%s] closed\n", VIDEO_DEVICE);
+	pthread_detach(pthread_self());
+	camera_running = 0;
 
 	return NULL;
 }
 
 static void* start_client (void *args)
 {
-	char *data;
-	int fd, len;
-	char *message;
-	struct client_info *info = (struct client_info*)args;
+	int fd;
+	struct buffer *buf;
 	unsigned int sleep_us;
+	char message[MAX_BUFFER_SIZE];
+	struct client_info *info = (struct client_info*)args;
 
-	data = malloc(sizeof(char) * VIDEO_WIDTH * VIDEO_HEIGHT * 4);
-	if (!data) {
-		syslog(LOG_ERR, "no memory");
-		return NULL;
-	}
-
-	message = malloc(sizeof(char) * MAX_BUFFER_SIZE);
-	if (!message) {
-		perror("no memory");
-		free(data);
-		return NULL;
-	}
-
-	fd = info->fd;
 	syslog(LOG_DEBUG, "establised connection from host '%s' on port '%d'\n",
 		inet_ntoa(info->sockaddr.sin_addr),
 		ntohs(info->sockaddr.sin_port));
 
-	while(1) {
-		pthread_mutex_lock(&mutex);
-		len = image.length;
-		memcpy(data, image.start, len);
-		pthread_mutex_unlock(&mutex);
+	buf = calloc(1, sizeof(*buf));
+	if (!buf) {
+		printf("malloc() failed\n");
+		goto failed;
+	}
+
+	buf->start = malloc(imagesize);
+	if (!buf->start) {
+		printf("malloc() failed\n");
+		goto failed;
+	}
+
+	info->circ_buffer = alloc_circ_buffer();
+	if (!info->circ_buffer) {
+		syslog(LOG_ERR, "calloc() failed");
+		goto failed;
+	}
+
+	fd = info->fd;
+	while(camera_running) {
+		/* get image buffer from the queue */
+		queue_get(info->circ_buffer, buf);
 
 		/* send start header */
 		memset(message, '\0', MAX_BUFFER_SIZE);
@@ -267,13 +380,13 @@ static void* start_client (void *args)
 			"boundary=fooboundary\r\n\r\n"
 			"--fooboundary\r\n"
 			"Content-type: image/jpeg\r\n"
-			"Content-Length: %d\r\n\r\n", len);
+			"Content-Length: %d\r\n\r\n", buf->length);
 
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 
 		/* send the image */
-		if (send(fd, data, len, MSG_NOSIGNAL) < 0)
+		if (send(fd, buf->start, buf->length, MSG_NOSIGNAL) < 0)
 			goto failed;
 
 		/* send remaining header */
@@ -282,52 +395,59 @@ static void* start_client (void *args)
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 
+		/* throttle to targeted fps */
 		sleep_us = 1000 * (((double)1/TARGET_FPS) * 1000);
-		usleep(sleep_us); /* throttle to targeted fps */
+		usleep(sleep_us);
 	}
 failed:
 	syslog(LOG_DEBUG, "closing connection from host '%s' on port '%d'\n",
 		inet_ntoa(info->sockaddr.sin_addr),
 		ntohs(info->sockaddr.sin_port));
-	free(args);
-	pthread_mutex_lock(&mutex);
-	active_client_count--;
-	pthread_mutex_unlock(&mutex);
-	free(message);
-	free(data);
 	close(fd);
+
+	if (buf) {
+		free(buf->start);
+		free(buf);
+	}
+
+	memset(info, '\0', sizeof(*info));
+	free_circ_buffer(info->circ_buffer);
+	pthread_detach(pthread_self());
+
 	return NULL;
 }
 
-static void http_error(int fd)
+static void http_error(int fd, char *message)
 {
-	char str[MAX_BUFFER_SIZE];
-	char ERR_TOO_MANY_CONNECTION[] = 
-		"<TITLE>ERROR</TITLE><H2>Too many connection!</H2>";
+	char buf[MAX_BUFFER_SIZE];
 
-	snprintf(str, MAX_BUFFER_SIZE,
-			"HTTP/1.1 200 OK\r\n"
-			"Content-Type: text/html;\r\n\r\n");
-
-	send(fd, str, strlen(str), MSG_NOSIGNAL);
-	send(fd, ERR_TOO_MANY_CONNECTION, strlen(ERR_TOO_MANY_CONNECTION),
-		MSG_NOSIGNAL);
+	snprintf(buf, MAX_BUFFER_SIZE,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html;\r\n"
+		"Content-Length: %d\r\n\r\n"
+		"%s", strlen(message), message);
+	send(fd, buf, strlen(buf), MSG_NOSIGNAL);
 	close(fd);
 }
 
 static void add_new_connection (int server_fd)
 {
-	int fd;
+	int i, fd;
 	pthread_t tid;
 	socklen_t size;
 	struct sockaddr_in client;
-	struct client_info *info;
+	struct client_info *info = NULL;
 	char buf[MAX_BUFFER_SIZE] = {0};
 
 	size = sizeof(client);
 	fd = accept(server_fd, (struct sockaddr*)&client, &size);
 	if (fd < 0) {
 		syslog(LOG_ERR, "failed to accept connection:%s",strerror(errno));
+		return;
+	}
+
+	if (!camera_running) {
+		http_error(fd, "failed to connect to camera!");
 		return;
 	}
 
@@ -338,28 +458,25 @@ static void add_new_connection (int server_fd)
 	 * otherwise send the HTML index page.
 	 */
 	if (strstr(buf, "stream_mjpeg")) {
-		/* check if we have reached to the connection limit */
+		/* find a available client info object */
 		pthread_mutex_lock(&mutex);
-		if (active_client_count == MAX_CONNECTION) {
-			pthread_mutex_unlock(&mutex);
-			http_error(fd);
-			syslog(LOG_ERR, "too many connection!");
-			return;
+		for (i = 0; i < MAX_CONNECTION; i++) {
+			if (!clients[i].fd) {
+				info = &clients[i];
+				break;
+			}
 		}
-		active_client_count++;
 		pthread_mutex_unlock(&mutex);
 
-		info = malloc(sizeof(*info));
-		if (!info) {
-			syslog(LOG_ERR, "no memory");
+		if (i >= MAX_CONNECTION) {
+			http_error(fd, "Error: too many connections!");
 			return;
 		}
+
 		info->fd = fd;
 		memcpy(&info->sockaddr, &client, size);
 		pthread_create(&tid, NULL, start_client, (void*)info);
-
 	} else {
-
 		snprintf(buf, MAX_BUFFER_SIZE,
 			"HTTP/1.1 200 OK\r\n"
 			"Content-Type: text/html;\r\n"
@@ -376,7 +493,7 @@ static int create_sock (int port)
 {
 	int fd;
 	struct sockaddr_in server;
-	
+
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		syslog(LOG_ERR, "socket create failed: %s", strerror(errno));
@@ -416,7 +533,10 @@ int main(int argc, char **argv)
 	}
 	/* create a server socket */
 	server_fd = create_sock(SERVER_PORT);
-	
+
+	pthread_mutex_init(&circ_buffer.mutex, NULL);
+	pthread_cond_init(&circ_buffer.cond, NULL);
+
 	/* spawn image capture thread */
 	pthread_mutex_init(&mutex, NULL);
 	pthread_create(&camera_tid, NULL, start_camera, NULL);
