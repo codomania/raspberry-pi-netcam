@@ -422,23 +422,16 @@ static void* start_client (void *args)
 		/* get image buffer from the queue */
 		queue_get(info->circ_buffer, buf);
 
-		/* send JPEG boundary start */
+		/* send JPEG boundary header */
 		memset(message, '\0', MAX_BUFFER_SIZE);
 		snprintf(message, MAX_BUFFER_SIZE,
 			"--fooboundary\r\n"
-			"Content-type: image/jpeg\r\n"
-			"Content-Length: %d\r\n\r\n", buf->length);
+			"Content-type: image/jpeg\r\n\r\n");
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 
 		/* send the image */
 		if (send(fd, buf->start, buf->length, MSG_NOSIGNAL) < 0)
-			goto failed;
-
-		/* send boundary end header */
-		memset(message, '\0', MAX_BUFFER_SIZE);
-		snprintf(message, MAX_BUFFER_SIZE, "\r\n--fooboundary\r\n");
-		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 	}
 failed:
