@@ -34,7 +34,7 @@
 #define MAX_CONNECTION	10
 #define SERVER_PORT	8081
 #define MAX_BUFFER_SIZE	4096
-#define NUM_CIRC_BUFS	10
+#define NUM_CIRC_BUFS	30
 
 #define INDEX_HTML	"\
 <HTML>\r\n\
@@ -57,9 +57,11 @@ struct buffer {
 };
 
 struct circ_buffer {
+	int prerolling;
 	int head, tail;
 	pthread_cond_t cond;
 	pthread_mutex_t mutex;
+	pthread_cond_t prerolled;
 	struct buffer data[NUM_CIRC_BUFS];
 };
 
@@ -77,12 +79,17 @@ static struct client_info clients[MAX_CONNECTION];
 static void queue_get(struct circ_buffer *circ_buf, struct buffer *buf)
 {
 	pthread_mutex_lock(&circ_buf->mutex);
-	if (circ_buf->head == circ_buf->tail) /* queue is empty */
+
+	/* queue is empty, block the caller */
+	if (circ_buf->head == circ_buf->tail)
 		pthread_cond_wait(&circ_buf->cond, &circ_buf->mutex);
+
+	/* copy the data from circular buffer and advance the head */
 	buf->length = circ_buf->data[circ_buf->head].length;
 	buf->timestamp = circ_buf->data[circ_buf->head].timestamp;
 	memcpy(buf->start, circ_buf->data[circ_buf->head].start, buf->length);
 	circ_buf->head = (circ_buf->head + 1) % NUM_CIRC_BUFS;
+
 	pthread_mutex_unlock(&circ_buf->mutex);
 }
 
@@ -91,18 +98,32 @@ static void queue_put(struct circ_buffer *circ_buf, struct buffer *buf)
 	int head, tail;
 
 	pthread_mutex_lock(&circ_buf->mutex);
+	/* copy the data into circular buffer and advance the tail */
 	head = circ_buf->head;
 	tail = circ_buf->tail;
 	memcpy(circ_buf->data[tail].start, buf->start, buf->length);
 	circ_buf->data[tail].length = buf->length;
 	circ_buf->data[tail].timestamp = buf->timestamp;
 	tail = (tail + 1) % NUM_CIRC_BUFS;
-	if (tail == head) /* queue is full */
+
+	/* if client is waiting for buffer to be prerolled then notify it */
+	if (circ_buf->prerolling && (tail >= NUM_CIRC_BUFS - 2)) {
+		circ_buf->prerolling = 0;
+		pthread_cond_broadcast(&circ_buf->prerolled);
+	}
+
+	/* queue is full */
+	if (tail == head)
 		head = head + 1;
-	if (head >= NUM_CIRC_BUFS) /* reset head */
+
+	/* reset the head (if needed) */
+	if (head >= NUM_CIRC_BUFS)
 		head = 0;
+
 	circ_buf->head = head;
 	circ_buf->tail = tail;
+
+	/* notify client thread */
 	pthread_cond_broadcast(&circ_buf->cond);
 	pthread_mutex_unlock(&circ_buf->mutex);
 }
@@ -111,6 +132,7 @@ static void broadcast_image(struct buffer *buf)
 {
 	int i;
 
+	/* iterate through all active clients and put the data in there circular buffer */
 	pthread_mutex_lock(&mutex);
 	for (i = 0; i < MAX_CONNECTION; i++) {
 		if (clients[i].fd && clients[i].circ_buffer)
@@ -145,6 +167,7 @@ static struct circ_buffer* alloc_circ_buffer()
 
 	pthread_mutex_init(&buf->mutex, NULL);
 	pthread_cond_init(&buf->cond, NULL);
+	pthread_cond_init(&buf->prerolled, NULL);
 
 	for (i = 0; i < NUM_CIRC_BUFS; i++) {
 		buf->data[i].start = malloc(imagesize);
@@ -336,11 +359,21 @@ failed:
 	return NULL;
 }
 
+static int time_diff(struct timeval *end, struct timeval *start)
+{
+	int ms = 0;
+
+	ms = (end->tv_sec - start->tv_sec) * 1000;
+	ms += (end->tv_usec - end->tv_usec) / 1000;
+	return ms;
+}
+
 static void* start_client (void *args)
 {
 	int fd;
 	struct buffer *buf;
 	char message[MAX_BUFFER_SIZE];
+	struct timeval start_time, end_time;
 	struct client_info *info = (struct client_info*)args;
 
 	syslog(LOG_DEBUG, "establised connection from host '%s' on port '%d'\n",
@@ -366,7 +399,16 @@ static void* start_client (void *args)
 		syslog(LOG_ERR, "calloc() failed");
 		goto failed;
 	}
-	
+
+	/* wait for circular buffer to be prerolled */
+	pthread_mutex_lock(&info->circ_buffer->mutex);
+	info->circ_buffer->prerolling = 1;
+	gettimeofday(&start_time, NULL);
+	pthread_cond_wait(&info->circ_buffer->prerolled, &info->circ_buffer->mutex);
+	gettimeofday(&end_time, NULL);
+	pthread_mutex_unlock(&info->circ_buffer->mutex);
+	printf("took %d ms to preroll the buffers\n", time_diff(&end_time, &start_time));
+
 	while(camera_running) {
 		/* get image buffer from the queue */
 		queue_get(info->circ_buffer, buf);
