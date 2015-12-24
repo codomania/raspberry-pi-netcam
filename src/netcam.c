@@ -34,7 +34,6 @@
 #define MAX_CONNECTION	10
 #define SERVER_PORT	8081
 #define MAX_BUFFER_SIZE	4096
-#define TARGET_FPS	30
 #define NUM_CIRC_BUFS	10
 
 #define INDEX_HTML	"\
@@ -54,15 +53,14 @@
 struct buffer {
         void   *start;
         size_t length;
+	struct timeval timestamp;
 };
 
 struct circ_buffer {
-	int len;
 	int head, tail;
 	pthread_cond_t cond;
 	pthread_mutex_t mutex;
-	void *data[NUM_CIRC_BUFS];
-	int length[NUM_CIRC_BUFS];
+	struct buffer data[NUM_CIRC_BUFS];
 };
 
 struct client_info {
@@ -72,31 +70,32 @@ struct client_info {
 };
 
 static int imagesize;
-static pthread_mutex_t mutex;
-static struct circ_buffer circ_buffer;
-static struct client_info clients[MAX_CONNECTION];
 static int camera_running;
+static pthread_mutex_t mutex;
+static struct client_info clients[MAX_CONNECTION];
 
 static void queue_get(struct circ_buffer *circ_buf, struct buffer *buf)
 {
 	pthread_mutex_lock(&circ_buf->mutex);
 	if (circ_buf->head == circ_buf->tail) /* queue is empty */
 		pthread_cond_wait(&circ_buf->cond, &circ_buf->mutex);
-	buf->length = circ_buf->length[circ_buf->head];
-	memcpy(buf->start, circ_buf->data[circ_buf->head], buf->length);
+	buf->length = circ_buf->data[circ_buf->head].length;
+	buf->timestamp = circ_buf->data[circ_buf->head].timestamp;
+	memcpy(buf->start, circ_buf->data[circ_buf->head].start, buf->length);
 	circ_buf->head = (circ_buf->head + 1) % NUM_CIRC_BUFS;
 	pthread_mutex_unlock(&circ_buf->mutex);
 }
 
-static void queue_put(struct circ_buffer *circ_buf, void *buf, int len)
+static void queue_put(struct circ_buffer *circ_buf, struct buffer *buf)
 {
 	int head, tail;
 
 	pthread_mutex_lock(&circ_buf->mutex);
 	head = circ_buf->head;
 	tail = circ_buf->tail;
-	memcpy(circ_buf->data[tail], buf, len);
-	circ_buf->length[tail] = len;
+	memcpy(circ_buf->data[tail].start, buf->start, buf->length);
+	circ_buf->data[tail].length = buf->length;
+	circ_buf->data[tail].timestamp = buf->timestamp;
 	tail = (tail + 1) % NUM_CIRC_BUFS;
 	if (tail == head) /* queue is full */
 		head = head + 1;
@@ -108,14 +107,14 @@ static void queue_put(struct circ_buffer *circ_buf, void *buf, int len)
 	pthread_mutex_unlock(&circ_buf->mutex);
 }
 
-static void broadcast_image(void *buf, int len)
+static void broadcast_image(struct buffer *buf)
 {
 	int i;
 
 	pthread_mutex_lock(&mutex);
 	for (i = 0; i < MAX_CONNECTION; i++) {
 		if (clients[i].fd && clients[i].circ_buffer)
-			queue_put(clients[i].circ_buffer, buf, len);
+			queue_put(clients[i].circ_buffer, buf);
 	}
 	pthread_mutex_unlock(&mutex);
 }
@@ -127,8 +126,8 @@ static void free_circ_buffer(struct circ_buffer *buf)
 	if (buf) {
 		printf("free circular buffer %p\n", buf);
 		for (i = 0; i < NUM_CIRC_BUFS; i++)
-			if (buf->data[i])
-				free(buf->data[i]);
+			if (buf->data[i].start)
+				free(buf->data[i].start);
 		pthread_mutex_destroy(&buf->mutex);
 		pthread_cond_destroy(&buf->cond);
 		free(buf);
@@ -148,8 +147,8 @@ static struct circ_buffer* alloc_circ_buffer()
 	pthread_cond_init(&buf->cond, NULL);
 
 	for (i = 0; i < NUM_CIRC_BUFS; i++) {
-		buf->data[i] = malloc(imagesize);
-		if ((buf->data[i]) == NULL) {
+		buf->data[i].start = malloc(imagesize);
+		if ((buf->data[i].start) == NULL) {
 			syslog(LOG_ERR, "malloc() failed %s\n", strerror(errno));
 			goto failed;
 		}
@@ -187,7 +186,7 @@ static void* start_camera (void *unused)
         struct v4l2_requestbuffers req;
         enum v4l2_buf_type type;
         unsigned int i, n_buffers;
-        struct buffer *buffers;
+        struct buffer *buffers, image_buf;
         struct v4l2_format fmt;
 	struct ifaddrs *ipaddrs, *tmp;
 
@@ -307,7 +306,10 @@ static void* start_camera (void *unused)
 			goto stop_stream;
 
 		/* send buffer to clients */
-		broadcast_image(buffers[buf.index].start, buf.length);
+		image_buf.start = buffers[buf.index].start;
+		image_buf.length = buf.length;
+		image_buf.timestamp = buf.timestamp;
+		broadcast_image(&image_buf);
 
 		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
 			goto stop_stream;
@@ -338,13 +340,14 @@ static void* start_client (void *args)
 {
 	int fd;
 	struct buffer *buf;
-	unsigned int sleep_us;
 	char message[MAX_BUFFER_SIZE];
 	struct client_info *info = (struct client_info*)args;
 
 	syslog(LOG_DEBUG, "establised connection from host '%s' on port '%d'\n",
 		inet_ntoa(info->sockaddr.sin_addr),
 		ntohs(info->sockaddr.sin_port));
+
+	fd = info->fd;
 
 	buf = calloc(1, sizeof(*buf));
 	if (!buf) {
@@ -363,8 +366,7 @@ static void* start_client (void *args)
 		syslog(LOG_ERR, "calloc() failed");
 		goto failed;
 	}
-
-	fd = info->fd;
+	
 	while(camera_running) {
 		/* get image buffer from the queue */
 		queue_get(info->circ_buffer, buf);
@@ -394,24 +396,23 @@ static void* start_client (void *args)
 		snprintf(message, MAX_BUFFER_SIZE, "\r\n--fooboundary\r\n");
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
-
-		/* throttle to targeted fps */
-		sleep_us = 1000 * (((double)1/TARGET_FPS) * 1000);
-		usleep(sleep_us);
 	}
 failed:
 	syslog(LOG_DEBUG, "closing connection from host '%s' on port '%d'\n",
 		inet_ntoa(info->sockaddr.sin_addr),
 		ntohs(info->sockaddr.sin_port));
-	close(fd);
+
+	pthread_mutex_lock(&mutex);
+	free_circ_buffer(info->circ_buffer);
+	memset(info, '\0', sizeof(*info));
+	pthread_mutex_unlock(&mutex);
 
 	if (buf) {
 		free(buf->start);
 		free(buf);
 	}
 
-	memset(info, '\0', sizeof(*info));
-	free_circ_buffer(info->circ_buffer);
+	close(fd);
 	pthread_detach(pthread_self());
 
 	return NULL;
@@ -533,9 +534,6 @@ int main(int argc, char **argv)
 	}
 	/* create a server socket */
 	server_fd = create_sock(SERVER_PORT);
-
-	pthread_mutex_init(&circ_buffer.mutex, NULL);
-	pthread_cond_init(&circ_buffer.cond, NULL);
 
 	/* spawn image capture thread */
 	pthread_mutex_init(&mutex, NULL);
