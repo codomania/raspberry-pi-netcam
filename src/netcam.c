@@ -409,23 +409,25 @@ static void* start_client (void *args)
 	pthread_mutex_unlock(&info->circ_buffer->mutex);
 	printf("took %d ms to preroll the buffers\n", time_diff(&end_time, &start_time));
 
+	/* send http start header */
+	memset(message, '\0', MAX_BUFFER_SIZE);
+	snprintf(message, MAX_BUFFER_SIZE,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-type: multipart/x-mixed-replace; boundary=fooboundary\r\n\r\n");
+
+	if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
+		goto failed;
+
 	while(camera_running) {
 		/* get image buffer from the queue */
 		queue_get(info->circ_buffer, buf);
 
-		/* send start header */
+		/* send JPEG boundary start */
 		memset(message, '\0', MAX_BUFFER_SIZE);
 		snprintf(message, MAX_BUFFER_SIZE,
-			"HTTP/1.1 200 OK\r\n"
-			"Cache-Control: no-cache\r\n"
-			"Cache-Control: private\r\n"
-			"Pragma: no-cache\r\n"
-			"Content-Type: multipart/x-mixed-replace;"
-			"boundary=fooboundary\r\n\r\n"
 			"--fooboundary\r\n"
 			"Content-type: image/jpeg\r\n"
 			"Content-Length: %d\r\n\r\n", buf->length);
-
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
 			goto failed;
 
@@ -433,7 +435,7 @@ static void* start_client (void *args)
 		if (send(fd, buf->start, buf->length, MSG_NOSIGNAL) < 0)
 			goto failed;
 
-		/* send remaining header */
+		/* send boundary end header */
 		memset(message, '\0', MAX_BUFFER_SIZE);
 		snprintf(message, MAX_BUFFER_SIZE, "\r\n--fooboundary\r\n");
 		if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
