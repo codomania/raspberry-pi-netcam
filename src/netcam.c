@@ -62,17 +62,19 @@ struct circ_buffer {
 	pthread_cond_t cond;
 	pthread_mutex_t mutex;
 	pthread_cond_t prerolled;
-	struct buffer data[NUM_CIRC_BUFS];
+	struct buffer data[NUM_CIRC_BUFS];	/* circular buffers */
 };
 
 struct client_info {
 	int fd;
+	struct buffer buffer;			/* current buffer sent to socket */
 	struct sockaddr_in sockaddr;
 	struct circ_buffer *circ_buffer;
 };
 
-static int imagesize;
+static int imagesize = VIDEO_WIDTH * VIDEO_HEIGHT * 1.5;
 static int camera_running;
+static pthread_cond_t cond;
 static pthread_mutex_t mutex;
 static struct client_info clients[MAX_CONNECTION];
 
@@ -128,17 +130,22 @@ static void queue_put(struct circ_buffer *circ_buf, struct buffer *buf)
 	pthread_mutex_unlock(&circ_buf->mutex);
 }
 
-static void broadcast_image(struct buffer *buf)
+static int broadcast_image(struct buffer *buf)
 {
 	int i;
+	int active = -1;
 
 	/* iterate through all active clients and put the data in there circular buffer */
 	pthread_mutex_lock(&mutex);
 	for (i = 0; i < MAX_CONNECTION; i++) {
-		if (clients[i].fd && clients[i].circ_buffer)
+		if (clients[i].circ_buffer) {
 			queue_put(clients[i].circ_buffer, buf);
+			active = 0;
+		}
 	}
 	pthread_mutex_unlock(&mutex);
+
+	return active;
 }
 
 static void free_circ_buffer(struct circ_buffer *buf)
@@ -304,6 +311,7 @@ static void* start_camera (void *unused)
 	}
 
 	camera_running = 1;
+	pthread_cond_broadcast(&cond);
 
 	while (1) {
 		do {
@@ -332,13 +340,15 @@ static void* start_camera (void *unused)
 		image_buf.start = buffers[buf.index].start;
 		image_buf.length = buf.length;
 		image_buf.timestamp = buf.timestamp;
-		broadcast_image(&image_buf);
+		if (broadcast_image(&image_buf) < 0)
+			goto stop_stream;
 
 		if (xioctl(fd, VIDIOC_QBUF, &buf) < 0)
 			goto stop_stream;
 	}
 
 stop_stream:
+	camera_running = 0;
 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	xioctl(fd, VIDIOC_STREAMOFF, &type);
 	syslog(LOG_DEBUG, "[%s] stopping streaming\n", VIDEO_DEVICE);
@@ -354,71 +364,42 @@ failed:
 	v4l2_close(fd);
 	printf("[%s] closed\n", VIDEO_DEVICE);
 	pthread_detach(pthread_self());
-	camera_running = 0;
+	pthread_cond_broadcast(&cond);
 
 	return NULL;
 }
 
-static int time_diff(struct timeval *end, struct timeval *start)
+static void remove_connection(struct client_info *info)
 {
-	int ms = 0;
+	if (!info)
+		return;
 
-	ms = (end->tv_sec - start->tv_sec) * 1000;
-	ms += (end->tv_usec - end->tv_usec) / 1000;
-	return ms;
+	syslog(LOG_DEBUG, "closing connection from host '%s' on port '%d'\n",
+		inet_ntoa(info->sockaddr.sin_addr),
+		ntohs(info->sockaddr.sin_port));
+	
+	pthread_mutex_lock(&mutex);
+
+	close(info->fd);
+	if (info->buffer.start)
+		free(info->buffer.start);
+	if (info->circ_buffer)
+		free_circ_buffer(info->circ_buffer);
+	memset(info, '\0', sizeof(struct client_info));
+
+	pthread_mutex_unlock(&mutex);
 }
 
 static void* start_client (void *args)
 {
 	int fd;
-	struct buffer *buf;
 	char message[MAX_BUFFER_SIZE];
-	struct timeval start_time, end_time;
 	struct client_info *info = (struct client_info*)args;
-
-	syslog(LOG_DEBUG, "establised connection from host '%s' on port '%d'\n",
-		inet_ntoa(info->sockaddr.sin_addr),
-		ntohs(info->sockaddr.sin_port));
+	struct buffer *buf = &info->buffer;
 
 	fd = info->fd;
 
-	buf = calloc(1, sizeof(*buf));
-	if (!buf) {
-		printf("malloc() failed\n");
-		goto failed;
-	}
-
-	buf->start = malloc(imagesize);
-	if (!buf->start) {
-		printf("malloc() failed\n");
-		goto failed;
-	}
-
-	info->circ_buffer = alloc_circ_buffer();
-	if (!info->circ_buffer) {
-		syslog(LOG_ERR, "calloc() failed");
-		goto failed;
-	}
-
-	/* wait for circular buffer to be prerolled */
-	pthread_mutex_lock(&info->circ_buffer->mutex);
-	info->circ_buffer->prerolling = 1;
-	gettimeofday(&start_time, NULL);
-	pthread_cond_wait(&info->circ_buffer->prerolled, &info->circ_buffer->mutex);
-	gettimeofday(&end_time, NULL);
-	pthread_mutex_unlock(&info->circ_buffer->mutex);
-	printf("took %d ms to preroll the buffers\n", time_diff(&end_time, &start_time));
-
-	/* send http start header */
-	memset(message, '\0', MAX_BUFFER_SIZE);
-	snprintf(message, MAX_BUFFER_SIZE,
-		"HTTP/1.1 200 OK\r\n"
-		"Content-type: multipart/x-mixed-replace; boundary=fooboundary\r\n\r\n");
-
-	if (send(fd, message, strlen(message), MSG_NOSIGNAL) < 0)
-		goto failed;
-
-	while(camera_running) {
+	while(1) {
 		/* get image buffer from the queue */
 		queue_get(info->circ_buffer, buf);
 
@@ -434,24 +415,10 @@ static void* start_client (void *args)
 		if (send(fd, buf->start, buf->length, MSG_NOSIGNAL) < 0)
 			goto failed;
 	}
+
 failed:
-	syslog(LOG_DEBUG, "closing connection from host '%s' on port '%d'\n",
-		inet_ntoa(info->sockaddr.sin_addr),
-		ntohs(info->sockaddr.sin_port));
-
-	pthread_mutex_lock(&mutex);
-	free_circ_buffer(info->circ_buffer);
-	memset(info, '\0', sizeof(*info));
-	pthread_mutex_unlock(&mutex);
-
-	if (buf) {
-		free(buf->start);
-		free(buf);
-	}
-
-	close(fd);
+	remove_connection(info);
 	pthread_detach(pthread_self());
-
 	return NULL;
 }
 
@@ -465,27 +432,102 @@ static void http_error(int fd, char *message)
 		"Content-Length: %d\r\n\r\n"
 		"%s", strlen(message), message);
 	send(fd, buf, strlen(buf), MSG_NOSIGNAL);
-	close(fd);
+}
+
+static void handle_new_connection(int fd, struct sockaddr_in *client)
+{
+	int i;
+	pthread_t camera_tid, client_tid;
+	struct client_info *info = NULL;
+	char message[MAX_BUFFER_SIZE] = {0};
+
+	pthread_mutex_lock(&mutex);
+
+	/* iterate through the clients arrary and see if we can add a new
+	 * connection
+	 */	
+	for (i = 0; i < MAX_CONNECTION; i++) {
+		if (!clients[i].fd) {
+			info = &clients[i];
+			break;
+		}
+	}
+
+	pthread_mutex_unlock(&mutex);
+
+	if (!info) {
+		http_error(fd, "Error: too many connections!");
+		goto failed;
+	}
+
+	info->fd = fd;
+	memcpy(&info->sockaddr, client, sizeof(*client));
+
+	syslog(LOG_DEBUG, "establised connection from host '%s' on port '%d'\n",
+		inet_ntoa(info->sockaddr.sin_addr),
+		ntohs(info->sockaddr.sin_port));
+
+	/* allocate the socket buffer */
+	info->buffer.start = malloc(imagesize);
+	if (!info->buffer.start) {
+		syslog(LOG_ERR, "calloc() failed\n");
+		goto failed;
+	}
+
+	/* allocate circular buffer */
+	info->circ_buffer = alloc_circ_buffer();
+	if (!info->circ_buffer) {
+		syslog(LOG_ERR, "calloc() failed");
+		goto failed;
+	}
+
+	/* start circular buffer to preroll */
+	info->circ_buffer->prerolling = 1;
+
+	/* if camera is not running then start it */
+	if (!camera_running) {
+
+		pthread_create(&camera_tid, NULL, start_camera, NULL);
+		pthread_mutex_lock(&mutex);
+		pthread_cond_wait(&cond, &mutex); /* wait for camera to start */
+		pthread_mutex_unlock(&mutex);
+		if (!camera_running)
+			goto failed;
+	}
+
+	/* send http start header */
+	snprintf(message, MAX_BUFFER_SIZE,
+		"HTTP/1.1 200 OK\r\n"
+		"Content-type: multipart/x-mixed-replace; boundary=fooboundary\r\n\r\n");
+
+	if (send(info->fd, message, strlen(message), MSG_NOSIGNAL) < 0)
+		goto failed;
+	
+	/* wait for circular buffer to be prerolled */
+	pthread_mutex_lock(&info->circ_buffer->mutex);
+	pthread_cond_wait(&info->circ_buffer->prerolled, &info->circ_buffer->mutex);
+	pthread_mutex_unlock(&info->circ_buffer->mutex);
+
+	pthread_create(&client_tid, NULL, start_client, (void*)info);
+
+	return;
+
+failed:
+	remove_connection(info);
+	return;
 }
 
 static void add_new_connection (int server_fd)
 {
-	int i, fd;
-	pthread_t tid;
+	int fd;
 	socklen_t size;
 	struct sockaddr_in client;
-	struct client_info *info = NULL;
 	char buf[MAX_BUFFER_SIZE] = {0};
 
 	size = sizeof(client);
 	fd = accept(server_fd, (struct sockaddr*)&client, &size);
 	if (fd < 0) {
 		syslog(LOG_ERR, "failed to accept connection:%s",strerror(errno));
-		return;
-	}
-
-	if (!camera_running) {
-		http_error(fd, "failed to connect to camera!");
 		return;
 	}
 
@@ -496,24 +538,7 @@ static void add_new_connection (int server_fd)
 	 * otherwise send the HTML index page.
 	 */
 	if (strstr(buf, "stream_mjpeg")) {
-		/* find a available client info object */
-		pthread_mutex_lock(&mutex);
-		for (i = 0; i < MAX_CONNECTION; i++) {
-			if (!clients[i].fd) {
-				info = &clients[i];
-				break;
-			}
-		}
-		pthread_mutex_unlock(&mutex);
-
-		if (i >= MAX_CONNECTION) {
-			http_error(fd, "Error: too many connections!");
-			return;
-		}
-
-		info->fd = fd;
-		memcpy(&info->sockaddr, &client, size);
-		pthread_create(&tid, NULL, start_client, (void*)info);
+		handle_new_connection(fd, &client);
 	} else {
 		snprintf(buf, MAX_BUFFER_SIZE,
 			"HTTP/1.1 200 OK\r\n"
@@ -523,8 +548,6 @@ static void add_new_connection (int server_fd)
 		send(fd, buf, strlen(buf), MSG_NOSIGNAL);
 		close(fd);
 	}
-
-	return;
 }
 
 static int create_sock (int port)
@@ -559,7 +582,6 @@ static int create_sock (int port)
 int main(int argc, char **argv)
 {
 	int i, server_fd;
-	pthread_t camera_tid;
 	fd_set active_fd_set, read_fd_set;
 
 	openlog(argv[0], LOG_CONS | LOG_PID | LOG_PERROR, LOG_USER);
@@ -572,9 +594,8 @@ int main(int argc, char **argv)
 	/* create a server socket */
 	server_fd = create_sock(SERVER_PORT);
 
-	/* spawn image capture thread */
 	pthread_mutex_init(&mutex, NULL);
-	pthread_create(&camera_tid, NULL, start_camera, NULL);
+	pthread_cond_init(&cond, NULL);
 
 	FD_ZERO(&active_fd_set);
 	FD_SET(server_fd, &active_fd_set);
@@ -596,7 +617,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	pthread_join(camera_tid, NULL);
 
         return 0;
 }
