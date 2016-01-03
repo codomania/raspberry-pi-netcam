@@ -429,7 +429,7 @@ static void http_error(int fd, char *message)
 	snprintf(buf, MAX_BUFFER_SIZE,
 		"HTTP/1.1 200 OK\r\n"
 		"Content-Type: text/html;\r\n"
-		"Content-Length: %d\r\n\r\n"
+		"Content-Length: %zu\r\n\r\n"
 		"%s", strlen(message), message);
 	send(fd, buf, strlen(buf), MSG_NOSIGNAL);
 }
@@ -543,7 +543,7 @@ static void add_new_connection (int server_fd)
 		snprintf(buf, MAX_BUFFER_SIZE,
 			"HTTP/1.1 200 OK\r\n"
 			"Content-Type: text/html;\r\n"
-			"Content-Length: %d\r\n\r\n"
+			"Content-Length: %zu\r\n\r\n"
 			"%s", strlen(INDEX_HTML), INDEX_HTML);
 		send(fd, buf, strlen(buf), MSG_NOSIGNAL);
 		close(fd);
